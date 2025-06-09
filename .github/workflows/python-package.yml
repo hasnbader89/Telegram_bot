@@ -1,0 +1,211 @@
+# This workflow will install Python dependencies, run tests and lint with a variety of Python versions
+# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python
+import asyncio
+import logging
+import os
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler
+import aiohttp
+import json
+
+# --- Settings ---
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8045271874:AAGaTThRco-5ZnNIEmvEsLpf79hOzieVGZc")
+PUMPFUN_API = "https://api.pump.fun/v1/tokens"
+RUGCHECK_API = "https://api.rugcheck.xyz/api/check/"
+GMGN_API = "https://api.gmgn.xyz/token/"
+SENT_TOKENS_FILE = "sent_tokens.json"
+AUTHORIZED_CHAT_ID = 7143072060  # Chat ID لـ @HB089
+
+# --- Logging ---
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+
+# --- Helper Function for Authorization ---
+
+def is_authorized_chat(update: Update) -> bool:
+    return update.effective_chat.id == AUTHORIZED_CHAT_ID
+
+# --- Persistent Storage ---
+
+def load_sent_tokens():
+    try:
+        with open(SENT_TOKENS_FILE, 'r') as f:
+            return set(json.load(f))
+    except FileNotFoundError:
+        return set()
+
+def save_sent_tokens(sent_tokens):
+    with open(SENT_TOKENS_FILE, 'w') as f:
+        json.dump(list(sent_tokens), f)
+
+# --- API Functions ---
+
+async def get_new_tokens(session: aiohttp.ClientSession):
+    try:
+        async with session.get(PUMPFUN_API) as response:
+            data = await response.json()
+            return data.get("tokens", [])
+    except Exception as e:
+        logging.error(f"خطأ في جلب التوكنات من PumpFun: {e}")
+        return []
+
+async def check_rug(session: aiohttp.ClientSession, token_address: str):
+    try:
+        async with session.get(RUGCHECK_API + token_address) as response:
+            result = await response.json()
+            return result.get("status") == "GOOD"
+    except Exception as e:
+        logging.error(f"خطأ في فحص Rug: {e}")
+        return False
+
+async def analyze_token(session: aiohttp.ClientSession, token_address: str):
+    try:
+        async with session.get(GMGN_API + token_address) as response:
+            data = await response.json()
+            return {
+                "liquidity": data.get("liquidity", "غير متوفر"),
+                "owners": data.get("holders", "غير معروف"),
+                "market_cap": data.get("market_cap", "غير متوفر"),
+                "age": data.get("age", "غير معروف"),
+                "trend": data.get("trend", "غير معروف"),
+                "price": data.get("price", "غير متوفر")
+            }
+    except Exception as e:
+        logging.error(f"خطأ في تحليل التوكن: {e}")
+        return {}
+
+# --- Telegram Communication ---
+
+async def send_token_report(update: Update, context: ContextTypes.DEFAULT_TYPE, token: dict, session: aiohttp.ClientSession):
+    if not is_authorized_chat(update):
+        return  # لا ترسل شيئًا إذا لم تكن الدردشة مصرحة
+
+    address = token.get("address")
+    name = token.get("name", "غير معروف")
+    image_url = token.get("image")
+
+    if not address or not await check_rug(session, address):
+        logging.info(f"التوكن {name} فشل في فحص Rug أو عنوان مفقود.")
+        return
+
+    analysis = await analyze_token(session, address)
+    if not analysis:
+        logging.info(f"فشل تحليل التوكن {name}.")
+        return
+
+    # تهيئة الأحرف الخاصة لـ Markdown V2
+    name = name.replace("_", "\\_").replace("*", "\\*").replace("[", "\\[").replace("`", "\\`")
+    address = address.replace("_", "\\_").replace("*", "\\*").replace("[", "\\[").replace("`", "\\`")
+
+    message = f"""
+🚀 توكن جديد: *{name}*
+🆔 العنوان: `{address}`
+
+✅ فحص Rug: جيد
+📊 السيولة: {analysis['liquidity']}$
+👥 الحائزون: {analysis['owners']}
+📈 القيمة السوقية: {analysis['market_cap']}$
+💰 السعر: {analysis['price']} SOL
+⏳ عمر العقد: {analysis['age']}
+📉 الاتجاه: {analysis['trend']}
+
+🔗 [رابط التوكن](https://pump.fun/token/{address})
+"""
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛒 شراء", callback_data=f"buy_{address}"),
+         InlineKeyboardButton("❌ تجاهل", callback_data=f"ignore_{address}")]
+    ])
+
+    try:
+        if image_url:
+            await context.bot.send_photo(
+                chat_id=update.effective_chat.id,
+                photo=image_url,
+                caption=message,
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=keyboard
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=message,
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=keyboard
+            )
+    except Exception as e:
+        logging.error(f"خطأ في إرسال الرسالة: {e}")
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="⚠️ خطأ في إرسال تقرير التوكن.",
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+
+# --- Monitor New Tokens ---
+
+async def monitor_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized_chat(update):
+        await update.message.reply_text("🚫 هذا البوت يعمل فقط في الدردشة المصرح بها.", parse_mode=ParseMode.MARKDOWN_V2)
+        return
+
+    sent_tokens = load_sent_tokens()
+    async with aiohttp.ClientSession() as session:
+        while not context.user_data.get("stop_monitor", False):
+            tokens = await get_new_tokens(session)
+            for token in tokens:
+                address = token.get("address")
+                if address and address not in sent_tokens:
+                    await send_token_report(update, context, token, session)
+                    sent_tokens.add(address)
+                    save_sent_tokens(sent_tokens)
+            await asyncio.sleep(30)
+
+# --- Telegram Commands ---
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized_chat(update):
+        await update.message.reply_text("🚫 هذا البوت يعمل فقط في الدردشة المصرح بها.", parse_mode=ParseMode.MARKDOWN_V2)
+        return
+    context.user_data["stop_monitor"] = False
+    await update.message.reply_text("📡 تم تشغيل البوت. ستصلك تنبيهات التوكنات.", parse_mode=ParseMode.MARKDOWN_V2)
+    context.application.create_task(monitor_tokens(update, context))
+
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized_chat(update):
+        await update.message.reply_text("🚫 هذا البوت يعمل فقط في الدردشة المصرح بها.", parse_mode=ParseMode.MARKDOWN_V2)
+        return
+    context.user_data["stop_monitor"] = True
+    await update.message.reply_text("🛑 تم إيقاف المراقبة.", parse_mode=ParseMode.MARKDOWN_V2)
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_authorized_chat(update):
+        await query.message.reply_text("🚫 هذا البوت يعمل فقط في الدردشة المصرح بها.", parse_mode=ParseMode.MARKDOWN_V2)
+        return
+    try:
+        action, token_id = query.data.split("_", 1)
+        await query.edit_message_reply_markup(reply_markup=None)
+        if action == "buy":
+            await query.message.reply_text(f"✅ شراء التوكن: `{token_id}`", parse_mode=ParseMode.MARKDOWN_V2)
+        elif action == "ignore":
+            await query.message.reply_text(f"🚫 تم تجاهل التوكن: `{token_id}`", parse_mode=ParseMode.MARKDOWN_V2)
+    except ValueError:
+        logging.error(f"بيانات استدعاء غير صالحة: {query.data}")
+        await query.message.reply_text("⚠️ إجراء غير صالح.", parse_mode=ParseMode.MARKDOWN_V2)
+
+# --- Main Entry ---
+
+def main():
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("stop", stop))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
